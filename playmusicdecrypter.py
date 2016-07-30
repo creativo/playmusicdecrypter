@@ -16,31 +16,60 @@
 # along with this program; if not, write to the Free Software Foundation,
 # Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
-__version__ = "2.0"
+__version__ = "2.0nop8"
+
+#
+# nop1: added folder.jpg/png downloading
+# nop2: modfied outfile naming scheme
+# nop3: added folder.jpg/png embedding
+# nop4: added albumartist tag
+# nop5: imported tag-all-files mod by dchrostowski (not toroughly tested yet)
+# nop6: added filename charset normalisation + length limits
+# nop7: added better runtime handling for adb and fix trouble with non-ascii symbols in file paths mod by nqxcode
+# nop8: added keep-encoded-files option to retain encoded files after decryption (=in case of a mess up theres no need to retransfer everything)
+#
 
 import os, sys, struct, re, glob, optparse, time
 import Crypto.Cipher.AES, Crypto.Util.Counter
 import mutagen
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC
+from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4Cover
 import sqlite3
-
+import urllib
 import superadb
-
+import unicodedata
+reload(sys)
+sys.setdefaultencoding('utf8')
 
 class PlayMusicDecrypter:
     """Decrypt MP3 file from Google Play Music offline storage (All Access)"""
-    def __init__(self, database, infile):
+    def __init__(self, database, infile, tag_all=False, keep_encoded=False):
+        self.nameproblem = False
         # Open source file
         self.infile = infile
         self.source = open(infile, "rb")
+        self.is_encrypted = True
 
         # Test if source file is encrypted
         start_bytes = self.source.read(4)
         if start_bytes != "\x12\xd3\x15\x27":
+        	self.is_encrypted = False
+        	
+        if not self.is_encrypted and not tag_all:
             raise ValueError("Invalid file format!")
 
         # Get file info
         self.database = database
         self.info = self.get_info()
+        self.info["XTitle"] = unicodedata.normalize('NFKD', self.info["Title"]).encode('ascii','ignore').strip()
+        self.info["XAlbum"] = unicodedata.normalize('NFKD', self.info["Album"]).encode('ascii','ignore').strip()
+        self.info["XArtist"] = unicodedata.normalize('NFKD', self.info["Artist"]).encode('ascii','ignore').strip()
+        self.info["XAlbumArtist"] = unicodedata.normalize('NFKD', self.info["AlbumArtist"]).encode('ascii','ignore').strip()
+        self.info["XComposer"] = unicodedata.normalize('NFKD', self.info["Composer"]).encode('ascii','ignore').strip()
+        self.info["XGenre"] = unicodedata.normalize('NFKD', self.info["Genre"]).encode('ascii','ignore').strip()
+
 
     def decrypt(self):
         """Decrypt one block"""
@@ -60,7 +89,11 @@ class PlayMusicDecrypter:
         """Decrypt all blocks and write them to outfile (or to stdout if outfile in not specified)"""
         destination = open(outfile, "wb") if outfile else sys.stdout
         while True:
-            decrypted = self.decrypt()
+            if self.is_encrypted:
+                decrypted = self.decrypt()
+            else:
+            	source = open(self.infile, 'rb').read()
+            	
             if not decrypted:
                 break
 
@@ -74,7 +107,7 @@ class PlayMusicDecrypter:
         cursor = db.cursor()
 
         cursor.execute("""SELECT Title, Album, Artist, AlbumArtist, Composer, Genre, Year, Duration,
-                                 TrackCount, TrackNumber, DiscCount, DiscNumber, Compilation, CpData
+                                 TrackCount, TrackNumber, DiscCount, DiscNumber, Compilation, CpData, AlbumId, SongId, AlbumArtLocation, ArtistId
                           FROM music
                           WHERE LocalCopyPath = ?""", (os.path.basename(self.infile),))
         row = cursor.fetchone()
@@ -85,23 +118,71 @@ class PlayMusicDecrypter:
 
     def normalize_filename(self, filename):
         """Remove invalid characters from filename"""
-        return unicode(re.sub(r'[<>:"/\\|?*]', " ", filename))
+        a = re.sub(r'[<>:"/\\|?*]', " ", filename)
+        return unicode(a)
 
-    def get_outfile(self):
+    def get_outfile(self, truncate=False):
+    	if self.info is None:
+    		return self.infile
         """Returns output filename based on song informations"""
-        destination_dir = os.path.join(self.normalize_filename(self.info["AlbumArtist"]),
-                                       self.normalize_filename(self.info["Album"]))
-        filename = u"{TrackNumber:02d} - {Title}.mp3".format(**self.info)
+        tmpdata1 = u"{XAlbumArtist}".format(**self.info)
+        
+        if len(tmpdata1) > 127:
+            #print("Err1:"+tmpdata1)
+            tmpdata1= u"[{AlbumId}]".format(**self.info)
+            tmpdata2= u"[{AlbumId}] - {XAlbum} ({Year})".format(**self.info)
+            self.nameproblem = True
+        else:
+            tmpdata2= u"{XAlbumArtist} - {XAlbum} ({Year})".format(**self.info)
+        if len(tmpdata2) > 127:
+            #print("Err2:"+tmpdata2)
+            tmpdata2= u"[{AlbumId}] - [{ArtistId}] ({Year})".format(**self.info)
+            self.nameproblem = True
+        
+        destination_dir = os.path.join(self.normalize_filename(tmpdata1), self.normalize_filename(tmpdata2))
+        
+        filename = u"{DiscNumber:02d}{TrackNumber:02d} - {XArtist} - {XTitle}".format(**self.info)
+        filename = (filename[:121] + '...mp3') if len(filename) > 127 else filename + '.mp3'
+
+        if len(filename) > 127:
+            #print("Err3:["+filename+"]")
+            filename = u"{DiscNumber:02d}{TrackNumber:02d} - {XTitle}.mp3".format(**self.info)
+            self.nameproblem = True
+        if len(filename) > 127:
+            #print("Err4:["+filename+"]")
+            filename = u"{DiscNumber:02d}{TrackNumber:02d}.mp3".format(**self.info)
+            self.nameproblem = True
+        	
         return os.path.join(destination_dir, self.normalize_filename(filename))
 
-    def update_id3(self, outfile):
+    def get_coverpath(self):
+        """Returns output filename based on song informations"""
+        tmpdata1 = u"{XAlbumArtist}".format(**self.info)
+        if len(tmpdata1) > 127:
+            #print("Err5:"+tmpdata1)
+            tmpdata1= u"[{AlbumId}]".format(**self.info)
+            tmpdata2= u"[{AlbumId}] - {XAlbum} ({Year})".format(**self.info)
+            self.nameproblem = True
+        else:
+            tmpdata2= u"{XAlbumArtist} - {XAlbum} ({Year})".format(**self.info)
+        if len(tmpdata2) > 127:
+            #print("Err6:"+tmpdata2)
+            tmpdata2= u"[{AlbumId}] - [{ArtistId}] ({Year})".format(**self.info)
+            self.nameproblem = True
+
+        destination_dir = os.path.join(self.normalize_filename(tmpdata1), self.normalize_filename(tmpdata2))
+        return os.path.join(destination_dir, "Folder.")
+
+    def update_id3(self, outfile, coverpath):
         """Update ID3 tags in outfile"""
         audio = mutagen.File(outfile, easy=True)
         audio.add_tags()
+        
         audio["title"] = self.info["Title"]
         audio["album"] = self.info["Album"]
         audio["artist"] = self.info["Artist"]
         audio["performer"] = self.info["AlbumArtist"]
+        audio["albumartist"] = self.info["AlbumArtist"]
         audio["composer"] = self.info["Composer"]
         audio["genre"] = self.info["Genre"]
         audio["date"] = str(self.info["Year"])
@@ -109,7 +190,44 @@ class PlayMusicDecrypter:
         audio["discnumber"] = str(self.info["DiscNumber"])
         audio["compilation"] = str(self.info["Compilation"])
         audio.save()
+        
+        try:
+            if not os.path.isfile(coverpath + 'jpg') and not os.path.isfile(coverpath + 'png'):
+                coverfile = urllib.URLopener()
+                coverfile.retrieve(str(self.info["AlbumArtLocation"]).strip(), coverpath + 'tmp')
+        except:
+            self.nameproblem = True
+            pass
+        
+        try:
+            if os.path.isfile(coverpath + 'tmp'):
+                imagedata=open(coverpath + 'tmp','rb').read()
+                if imagedata[1]=='P':
+                	os.rename(coverpath + 'tmp', coverpath + 'png')
+                else:
+                	os.rename(coverpath + 'tmp', coverpath + 'jpg')
+        except:
+            self.nameproblem = True
+            pass    
 
+        try:
+            filetype = ''
+            fileext = ''
+            if os.path.isfile(coverpath + 'png'):
+            	filetype = 'image/png'
+            	fileext = 'png'
+            elif os.path.isfile(coverpath + 'jpg'):
+            	filetype = 'image/jpeg'
+            	fileext = 'jpg'
+
+            if fileext != '':
+                imagedata=open(coverpath + fileext,'rb').read()
+                audio = MP3(outfile, ID3=ID3)
+                audio.tags.add(APIC(encoding=3, mime=filetype, type=3, u='covr', data=imagedata))
+                audio.save()
+        except:
+            self.nameproblem = True
+       	    pass
 
 def is_empty_file(filename):
     """Returns True if file doesn't exist or is empty"""
@@ -121,8 +239,8 @@ def pull_database(destination_dir=".", adb="adb"):
     print("Downloading Google Play Music database from device...")
     try:
         adb = superadb.SuperAdb(executable=adb)
-    except RuntimeError:
-        print("  Device is not connected! Exiting...")
+    except RuntimeError as e:
+        print("  {} Exiting...".format(e.message))
         sys.exit(1)
 
     if not os.path.isdir(destination_dir):
@@ -135,13 +253,13 @@ def pull_database(destination_dir=".", adb="adb"):
         sys.exit(1)
 
 
-def pull_library(source_dir="/data/data/com.google.android.music/files/music", destination_dir="encrypted", adb="adb"):
+def pull_library(source_dir="/data/data/com.google.android.music/files/music/", destination_dir="encrypted", adb="adb"):
     """Pull Google Play Music library from device"""
     print("Downloading encrypted MP3 files from device...")
     try:
         adb = superadb.SuperAdb(executable=adb)
-    except RuntimeError:
-        print("  Device is not connected! Exiting...")
+    except RuntimeError as e:
+        print("  {} Exiting...".format(e.message))
         sys.exit(1)
 
     if not os.path.isdir(destination_dir):
@@ -161,7 +279,7 @@ def pull_library(source_dir="/data/data/com.google.android.music/files/music", d
         sys.exit(1)
 
 
-def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.db"):
+def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.db", tag_all=False, keep_encoded=False):
     """Decrypt all MP3 files in source directory and write them to destination directory"""
     print("Decrypting MP3 files...")
     if not os.path.isdir(destination_dir):
@@ -172,8 +290,9 @@ def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.d
         start_time = time.time()
         for f in files:
             try:
-                decrypter = PlayMusicDecrypter(database, f)
-                print(u"  Decrypting file {} -> {}".format(f, decrypter.get_outfile()))
+                decrypter = PlayMusicDecrypter(database, f, tag_all)
+                action = "Decrypting" if decrypter.is_encrypted else "Copying"
+                print(u"{} file {} -> {}".format(action, f, decrypter.get_outfile()))
             except ValueError as e:
                 print(u"  Skipping file {} ({})".format(f, e))
                 continue
@@ -182,9 +301,12 @@ def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.d
             if not os.path.isdir(os.path.dirname(outfile)):
                 os.makedirs(os.path.dirname(outfile))
 
+            coverpath = os.path.join(destination_dir, decrypter.get_coverpath())
             decrypter.decrypt_all(outfile)
-            decrypter.update_id3(outfile)
-            os.remove(f)
+            decrypter.update_id3(outfile, coverpath)
+            decrypter.source.close()
+            if not decrypter.nameproblem and not keep_encoded:
+                os.remove(f)
         print("  Decryption finished ({:.1f}s)!".format(time.time() - start_time))
     else:
         print("  No files found! Exiting...")
@@ -202,8 +324,12 @@ def main():
                       help="local path to Google Play Music database file (will be downloaded from device via adb if not specified)")
     parser.add_option("-l", "--library",
                       help="local path to directory with encrypted MP3 files (will be downloaded from device via adb if not specified")
-    parser.add_option("-r", "--remote", default="/data/data/com.google.android.music/files/music",
+    parser.add_option("-r", "--remote", default="/data/data/com.google.android.music/files/music/",
                       help="remote path to directory with encrypted MP3 files on device (default: %default)")
+    parser.add_option("-t", "--tag_all", action="store_true", dest="tag_all_files",                      
+                      help="Add ID3 tags to all files and copy to export directory.")
+    parser.add_option("-k", "--keep-encoded", action="store_true", dest="keep_encoded",                      
+                      help="Keep encoded files (do not delete encoded files after decryption)")
     (options, args) = parser.parse_args()
 
     if len(args) < 1:
@@ -218,11 +344,13 @@ def main():
 
     # Download encrypted MP3 files from device via adb
     if not options.library:
-        options.library = os.path.join(destination_dir, "encrypted")
+        options.library = os.path.join(destination_dir, "encrypted_tmp")
         pull_library(options.remote, options.library, adb=options.adb)
 
+    decrypted_path = os.path.join(destination_dir, "dec")
+    
     # Decrypt all MP3 files
-    decrypt_files(options.library, destination_dir, options.database)
+    decrypt_files(options.library, decrypted_path, options.database, options.tag_all_files, options.keep_encoded)
 
 
 if __name__ == "__main__":
